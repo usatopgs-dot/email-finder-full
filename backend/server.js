@@ -1,208 +1,202 @@
 import express from "express";
-import * as cheerio from "cheerio";
 import dns from "dns/promises";
 import fetch from "node-fetch";
-
+import * as cheerio from "cheerio";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// CORS
+// Simple CORS (so Netlify can call Render)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+const API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
-const DISPOSABLE = new Set([
-  "mailinator.com",
-  "tempmail.com",
-  "10minutemail.com",
-  "guerrillamail.com",
-  "yopmail.com"
-]);
+app.get("/", (req, res) => {
+  res.send("Email Finder FULL API running");
+});
 
-function cleanEmails(arr) {
-  return [...new Set(arr.map(e => e.toLowerCase()))];
+function uniq(arr) {
+  return [...new Set((arr || []).filter(Boolean))];
 }
 
-async function hasMx(domain) {
+function extractEmailsFromText(text) {
+  const emails = [];
+  const re = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const matches = text.match(re) || [];
+  for (const m of matches) emails.push(m.toLowerCase());
+  return uniq(emails);
+}
+
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await dns.resolveMx(domain);
-    return r && r.length > 0;
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function scrapeEmailsFromWebsite(websiteUrl) {
+  try {
+    const res = await fetchWithTimeout(websiteUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 EmailFinderBot" }
+    }, 15000);
+
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    // 1) mailto links
+    const mailtos = [];
+    $("a[href^='mailto:']").each((_, el) => {
+      const href = $(el).attr("href") || "";
+      const email = href.replace("mailto:", "").split("?")[0].trim().toLowerCase();
+      if (email) mailtos.push(email);
+    });
+
+    // 2) plain emails on page
+    const plain = extractEmailsFromText(html);
+
+    // 3) Try common contact pages quickly (optional light)
+    const candidates = uniq(
+      $("a").map((_, el) => ($(el).attr("href") || "")).get()
+    ).filter(h => /contact|about|support/i.test(h));
+
+    const extra = [];
+    for (const href of candidates.slice(0, 2)) {
+      try {
+        const u = new URL(href, websiteUrl).toString();
+        const r2 = await fetchWithTimeout(u, { headers: { "User-Agent": "Mozilla/5.0 EmailFinderBot" } }, 12000);
+        const h2 = await r2.text();
+        extra.push(...extractEmailsFromText(h2));
+      } catch {}
+    }
+
+    return uniq([...mailtos, ...plain, ...extra]).slice(0, 50);
+  } catch {
+    return [];
+  }
+}
+
+const DISPOSABLE = new Set([
+  "mailinator.com","10minutemail.com","guerrillamail.com","tempmail.com","yopmail.com",
+  "getnada.com","trashmail.com","mintemail.com","fakeinbox.com"
+]);
+
+async function mxOk(email) {
+  try {
+    const domain = email.split("@")[1]?.toLowerCase();
+    if (!domain) return false;
+    if (DISPOSABLE.has(domain)) return false;
+    const mx = await dns.resolveMx(domain);
+    return Array.isArray(mx) && mx.length > 0;
   } catch {
     return false;
   }
 }
 
-async function verifyEmail(email) {
-  const domain = email.split("@")[1];
-  if (!domain) return false;
-  if (DISPOSABLE.has(domain)) return false;
-  return await hasMx(domain);
-}
+async function placesSearchText(query, maxResults = 20) {
+  if (!API_KEY) throw new Error("Missing GOOGLE_MAPS_API_KEY in Render env vars.");
 
-async function fetchHTML(url) {
-  try {
-    const r = await fetch(url, { headers:{ "user-agent":"Mozilla/5.0"} });
-    if(!r.ok) return "";
-    return await r.text();
-  } catch {
-    return "";
-  }
-}
+  const url = "https://places.googleapis.com/v1/places:searchText";
+  const body = {
+    textQuery: query,
+    maxResultCount: Math.min(Math.max(Number(maxResults || 20), 1), 100)
+  };
 
-async function scrapeWebsiteEmails(site) {
-  if(!site) return [];
-
-  let url = site;
-  if(!/^https?:\/\//i.test(url)) url = "https://" + url;
-
-  const html = await fetchHTML(url);
-  if(!html) return [];
-
-  const found = html.match(EMAIL_REGEX) || [];
-
-  const $ = cheerio.load(html);
-  const links = [];
-
-  $("a[href]").each((i,a)=>{
-    const h = $(a).attr("href") || "";
-    if(h.includes("contact") || h.includes("about")){
-      try{
-        links.push(new URL(h, url).toString());
-      }catch{}
-    }
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": API_KEY,
+      "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.nationalPhoneNumber,places.websiteUri"
+    },
+    body: JSON.stringify(body)
   });
 
-  for(const l of links.slice(0,3)){
-    const h = await fetchHTML(l);
-    if(h){
-      const m = h.match(EMAIL_REGEX) || [];
-      found.push(...m);
-    }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(JSON.stringify(data));
   }
 
-  return cleanEmails(found);
+  const places = (data.places || []).map(p => ({
+    name: p?.displayName?.text || "",
+    address: p?.formattedAddress || "",
+    rating: p?.rating ?? "",
+    phone: p?.nationalPhoneNumber || "",
+    website: p?.websiteUri || ""
+  }));
+
+  return places;
 }
 
-// -------- Google Places (NEW API) ----------
-async function placesSearch(textQuery, maxResults) {
+// Main runner
+app.post("/api/run", async (req, res) => {
+  try {
+    const { mode, items, maxResults, verify } = req.body || {};
+    const lines = Array.isArray(items) ? items : [];
 
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+    if (lines.length === 0) return res.status(400).json({ error: "No items provided." });
 
-  const res = await fetch(
-    "https://places.googleapis.com/v1/places:searchText",
-    {
-      method:"POST",
-      headers:{
-        "Content-Type":"application/json",
-        "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask":
-          "places.displayName,places.formattedAddress,places.rating,places.websiteUri,places.internationalPhoneNumber"
-      },
-      body: JSON.stringify({
-        textQuery,
-        maxResultCount: maxResults
-      })
-    }
-  );
+    const rows = [];
 
-  const data = await res.json();
-  return data.places || [];
-}
+    if (mode === "websites") {
+      for (const site of lines.slice(0, 100)) {
+        const website = site.trim();
+        const emails = await scrapeEmailsFromWebsite(website);
+        let verifiedEmails = [];
+        if (verify) {
+          const checks = await Promise.all(emails.map(async e => (await mxOk(e)) ? e : null));
+          verifiedEmails = uniq(checks);
+        }
+        rows.push({
+          name: "",
+          phone: "",
+          website,
+          address: "",
+          rating: "",
+          emails,
+          verifiedEmails
+        });
+      }
+    } else {
+      // places
+      for (const q of lines.slice(0, 20)) {
+        const places = await placesSearchText(q, maxResults || 20);
 
-// -------- API --------
-
-app.post("/api/places-to-csv", async (req, res) => {
-
-  const { textQuery, maxResults = 20, verifyEmails = false } = req.body;
-
-  if(!process.env.GOOGLE_MAPS_API_KEY){
-    return res.status(400).json({ error:"Missing GOOGLE_MAPS_API_KEY" });
-  }
-
-  if(!textQuery){
-    return res.status(400).json({ error:"textQuery required" });
-  }
-
-  const places = await placesSearch(textQuery, maxResults);
-
-  const rows = [];
-
-  for(const p of places){
-
-    const name = p.displayName?.text || "";
-    const phone = p.internationalPhoneNumber || "";
-    const website = p.websiteUri || "";
-    const address = p.formattedAddress || "";
-    const rating = p.rating || "";
-
-    let emails = [];
-    let verified = [];
-
-    if(website){
-      emails = await scrapeWebsiteEmails(website);
-
-      if(verifyEmails){
-        for(const e of emails){
-          if(await verifyEmail(e)) verified.push(e);
+        // small concurrency to avoid crashes
+        for (const p of places) {
+          const emails = p.website ? await scrapeEmailsFromWebsite(p.website) : [];
+          let verifiedEmails = [];
+          if (verify) {
+            const checks = await Promise.all(emails.map(async e => (await mxOk(e)) ? e : null));
+            verifiedEmails = uniq(checks);
+          }
+          rows.push({
+            name: p.name,
+            phone: p.phone,
+            website: p.website,
+            address: p.address,
+            rating: p.rating,
+            emails,
+            verifiedEmails
+          });
         }
       }
     }
 
-    rows.push({
-      businessName: name,
-      phone,
-      website,
-      address,
-      rating,
-      foundEmails: emails,
-      verifiedEmails: verified
-    });
+    res.json({ rows });
+  } catch (err) {
+    res.status(500).send(err?.message || String(err));
   }
-
-  const header = [
-    "Business Name",
-    "Phone",
-    "Website",
-    "Address",
-    "Rating",
-    "Emails",
-    "Verified Emails"
-  ];
-
-  const csvLines = [
-    header.join(","),
-    ...rows.map(r => [
-      `"${r.businessName.replace(/"/g,'""')}"`,
-      `"${r.phone}"`,
-      `"${r.website}"`,
-      `"${r.address.replace(/"/g,'""')}"`,
-      `"${r.rating}"`,
-      `"${r.foundEmails.join(" | ")}"`,
-      `"${r.verifiedEmails.join(" | ")}"`
-    ].join(","))
-  ];
-
-  res.json({
-    count: rows.length,
-    rows,
-    csv: csvLines.join("\n")
-  });
-
-});
-
-app.get("/", (req,res)=>{
-  res.send("Email Finder FULL API running");
 });
 
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log("Server running on " + PORT);
-});
+app.listen(PORT, () => console.log("Server running on " + PORT));
