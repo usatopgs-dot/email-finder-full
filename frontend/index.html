@@ -1,8 +1,219 @@
 <!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Email Finder Full</title></head>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Email Finder Full</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:0; background:#0b1220; color:#e7eefc;}
+    .wrap{max-width:980px; margin:0 auto; padding:18px;}
+    .card{background:#121a2b; border:1px solid #1f2a44; border-radius:14px; padding:14px; margin-bottom:14px;}
+    h1{font-size:20px; margin:0 0 8px;}
+    label{display:block; font-size:12px; opacity:.9; margin:10px 0 6px;}
+    input,textarea,select{width:100%; box-sizing:border-box; padding:10px; border-radius:10px; border:1px solid #263554; background:#0e1628; color:#e7eefc;}
+    textarea{min-height:120px; resize:vertical;}
+    .row{display:grid; grid-template-columns:1fr 1fr; gap:10px;}
+    .row3{display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;}
+    .btn{background:#4cc9f0; color:#06101a; border:0; padding:10px 12px; border-radius:10px; font-weight:700; cursor:pointer;}
+    .btn:disabled{opacity:.6; cursor:not-allowed;}
+    .muted{opacity:.8; font-size:12px;}
+    .status{white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; background:#0e1628; border:1px solid #263554; border-radius:10px; padding:10px;}
+    table{width:100%; border-collapse:collapse; font-size:12px;}
+    th,td{border-bottom:1px solid #24324f; padding:8px; vertical-align:top;}
+    th{opacity:.9; text-align:left;}
+    .pill{display:inline-block; padding:2px 8px; border-radius:999px; background:#0e1628; border:1px solid #263554; font-size:11px; opacity:.9;}
+  </style>
+</head>
 <body>
-<h2>Email Finder Full</h2>
-<p>Placeholder frontend.</p>
+  <div class="wrap">
+    <div class="card">
+      <h1>Email Finder Full</h1>
+      <div class="muted">Find businesses from Google Places (text query) → extract emails from websites → optional MX verify → download CSV.</div>
+
+      <label>Backend API URL</label>
+      <input id="apiBase" placeholder="https://email-finder-full.onrender.com" />
+
+      <div class="row3">
+        <div>
+          <label>Mode</label>
+          <select id="mode">
+            <option value="places">Places (text query)</option>
+            <option value="websites">Websites list (direct)</option>
+          </select>
+        </div>
+        <div>
+          <label>Max results (Places)</label>
+          <input id="maxResults" type="number" value="20" min="1" max="100"/>
+        </div>
+        <div>
+          <label>Verify emails (MX + disposable)</label>
+          <select id="verify">
+            <option value="true">ON</option>
+            <option value="false" selected>OFF</option>
+          </select>
+        </div>
+      </div>
+
+      <label id="listLabel">Queries (one per line)</label>
+      <textarea id="list" placeholder="pet groomer in Austin, TX&#10;dog groomer in Miami, FL"></textarea>
+
+      <div style="display:flex; gap:10px; align-items:center; margin-top:10px;">
+        <button class="btn" id="runBtn">Run</button>
+        <button class="btn" id="csvBtn" disabled>Download CSV</button>
+        <span class="pill" id="countPill">0 rows</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <label>Status</label>
+      <div class="status" id="status">Ready.</div>
+    </div>
+
+    <div class="card">
+      <label>Results</label>
+      <div style="overflow:auto;">
+        <table id="tbl">
+          <thead>
+            <tr>
+              <th>Business Name</th>
+              <th>Phone</th>
+              <th>Website</th>
+              <th>Address</th>
+              <th>Rating</th>
+              <th>Emails</th>
+              <th>Verified Emails</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id)=>document.getElementById(id);
+  const apiBase = $("apiBase");
+  const mode = $("mode");
+  const list = $("list");
+  const listLabel = $("listLabel");
+  const maxResults = $("maxResults");
+  const verify = $("verify");
+  const runBtn = $("runBtn");
+  const csvBtn = $("csvBtn");
+  const statusBox = $("status");
+  const tblBody = $("tbl").querySelector("tbody");
+  const countPill = $("countPill");
+
+  // default backend
+  apiBase.value = localStorage.getItem("apiBase") || "https://email-finder-full.onrender.com";
+
+  let lastRows = [];
+
+  function setStatus(msg){ statusBox.textContent = msg; }
+  function setCount(n){ countPill.textContent = n + " rows"; }
+
+  function toLines(txt){
+    return txt.split("\n").map(s=>s.trim()).filter(Boolean);
+  }
+
+  function escapeCsv(v){
+    const s = (v ?? "").toString();
+    if (s.includes('"') || s.includes(",") || s.includes("\n")) return '"' + s.replaceAll('"','""') + '"';
+    return s;
+  }
+
+  function downloadCsv(rows){
+    const headers = ["Business Name","Phone (if available)","Website (if available)","Address","Rating","Emails (from website)","Verified emails (MX ok + non-disposable)"];
+    const lines = [headers.join(",")];
+    for (const r of rows){
+      lines.push([
+        escapeCsv(r.name),
+        escapeCsv(r.phone || ""),
+        escapeCsv(r.website || ""),
+        escapeCsv(r.address || ""),
+        escapeCsv(r.rating ?? ""),
+        escapeCsv((r.emails||[]).join(" | ")),
+        escapeCsv((r.verifiedEmails||[]).join(" | "))
+      ].join(","));
+    }
+    const blob = new Blob([lines.join("\n")], {type:"text/csv;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "email_finder_results.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function render(rows){
+    tblBody.innerHTML = "";
+    for (const r of rows){
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${(r.name||"")}</td>
+        <td>${(r.phone||"")}</td>
+        <td>${r.website ? `<a href="${r.website}" target="_blank" rel="noreferrer">${r.website}</a>` : ""}</td>
+        <td>${(r.address||"")}</td>
+        <td>${(r.rating ?? "")}</td>
+        <td>${(r.emails||[]).join("<br>")}</td>
+        <td>${(r.verifiedEmails||[]).join("<br>")}</td>
+      `;
+      tblBody.appendChild(tr);
+    }
+    setCount(rows.length);
+    csvBtn.disabled = rows.length === 0;
+  }
+
+  mode.addEventListener("change", ()=>{
+    if(mode.value === "places"){
+      listLabel.textContent = "Queries (one per line)";
+      list.placeholder = "pet groomer in Austin, TX\\ndog groomer in Miami, FL";
+    }else{
+      listLabel.textContent = "Website URLs (one per line)";
+      list.placeholder = "https://example.com\\nhttps://another.com";
+    }
+  });
+
+  runBtn.addEventListener("click", async ()=>{
+    const base = apiBase.value.trim().replace(/\/+$/,"");
+    localStorage.setItem("apiBase", base);
+
+    const lines = toLines(list.value);
+    if(!base){ setStatus("Please add Backend API URL."); return; }
+    if(lines.length === 0){ setStatus("Please add at least 1 line."); return; }
+
+    runBtn.disabled = true;
+    csvBtn.disabled = true;
+    setStatus("Running... (Render free may take 30-60s to wake up)");
+
+    try{
+      const payload = {
+        mode: mode.value,
+        items: lines,
+        maxResults: Number(maxResults.value || 20),
+        verify: verify.value === "true"
+      };
+      const res = await fetch(base + "/api/run", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify(payload)
+      });
+      const text = await res.text();
+      if(!res.ok) throw new Error(text || ("HTTP " + res.status));
+      const data = JSON.parse(text);
+      lastRows = data.rows || [];
+      render(lastRows);
+      setStatus("Done. Rows: " + lastRows.length);
+    }catch(e){
+      setStatus("Error: " + (e.message || e));
+    }finally{
+      runBtn.disabled = false;
+    }
+  });
+
+  csvBtn.addEventListener("click", ()=> downloadCsv(lastRows));
+</script>
 </body>
 </html>
