@@ -1,5 +1,5 @@
 import express from "express";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";
 import dns from "dns/promises";
 import fetch from "node-fetch";
 
